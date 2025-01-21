@@ -1,270 +1,252 @@
 package main
 
 import (
-   "bytes"
-   "encoding/json"
-   "fmt"
-   "io"
-   "log"
-   "net"
-   "net/http"
-   "os"
-   "path/filepath"
-   "sync"
-   "time"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
 )
 
 const (
-   AWS_REGISTRY_ENDPOINT = "https://on9p48hjz3.execute-api.us-east-2.amazonaws.com/default/RegisterDevice"
-   DEVICE_ID            = "OP5-MAX-TEST-001"  // Changed to be more identifiable
-   STORAGE_PATH         = "./content"    
-   HEARTBEAT_INTERVAL   = 60 * time.Second
+	AWS_REGISTRY_ENDPOINT = "https://on9p48hjz3.execute-api.us-east-2.amazonaws.com/default/RegisterDevice"
+	DEVICE_ID             = "OP5-MAX-TEST-001"
+	STORAGE_PATH          = "./content"
 )
 
-type UploadRequest struct {
-   DeploymentId string  `json:"deploymentId"`
-   ProjectId    string  `json:"projectId"`
-   CustomerId   string  `json:"customerId"`
-   Things       []Thing `json:"things"`
-}
-
-type Thing struct {
-   ProductId   string `json:"productId"`
-   MediaUrl    string `json:"mediaUrl"`
-   NfcTagId    string `json:"nfcTagId"`
-   ProductName string `json:"productName"`
-}
-
+// Device registration structure
 type DeviceRegistration struct {
-   DeviceId  string `json:"deviceId"`
-   IpAddress string `json:"ipAddress"`
-   Status    string `json:"status"`
+	DeviceId  string `json:"deviceId"`
+	IpAddress string `json:"ipAddress"`
 }
 
-func getLocalIP() (string, error) {
-   log.Println("Attempting to get local IP address...")
-   
-   ifaces, err := net.Interfaces()
-   if err != nil {
-       return "", fmt.Errorf("failed to get network interfaces: %v", err)
-   }
-   
-   for _, iface := range ifaces {
-       log.Printf("Checking interface: %s", iface.Name)
-       
-       if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-           log.Printf("Skipping interface %s (loopback or down)", iface.Name)
-           continue
-       }
-
-       addrs, err := iface.Addrs()
-       if err != nil {
-           log.Printf("Failed to get addresses for interface %s: %v", iface.Name, err)
-           continue
-       }
-
-       for _, addr := range addrs {
-           if ipnet, ok := addr.(*net.IPNet); ok {
-               if ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
-                   log.Printf("Skipping IP %s (loopback or IPv6)", ipnet.IP)
-                   continue
-               }
-               log.Printf("Found valid IP: %s", ipnet.IP.String())
-               return ipnet.IP.String(), nil
-           }
-       }
-   }
-   
-   return "", fmt.Errorf("no valid IP address found")
+// Upload request structure
+type UploadRequest struct {
+	DeploymentId string  `json:"deploymentId"`
+	ProjectId    string  `json:"projectId"`
+	CustomerId   string  `json:"customerId"`
+	Things       []Thing `json:"things"`
 }
 
-func registerWithAWS(ip string) error {
-   log.Printf("Attempting to register device %s with IP %s", DEVICE_ID, ip)
-   
-   registration := DeviceRegistration{
-       DeviceId:  DEVICE_ID,
-       IpAddress: ip,
-       Status:    "online",
-   }
-
-   jsonData, err := json.Marshal(registration)
-   if err != nil {
-       return fmt.Errorf("failed to marshal registration data: %v", err)
-   }
-   
-   log.Printf("Sending registration request to AWS: %s", string(jsonData))
-
-   resp, err := http.Post(AWS_REGISTRY_ENDPOINT, "application/json", bytes.NewBuffer(jsonData))
-   if err != nil {
-       return fmt.Errorf("failed to send registration request: %v", err)
-   }
-   defer resp.Body.Close()
-
-   // Read and log response body
-   body, err := io.ReadAll(resp.Body)
-   if err != nil {
-       return fmt.Errorf("failed to read response body: %v", err)
-   }
-   log.Printf("AWS Response Status: %d, Body: %s", resp.StatusCode, string(body))
-
-   if resp.StatusCode != http.StatusOK {
-       return fmt.Errorf("failed to register device: status=%d body=%s", resp.StatusCode, string(body))
-   }
-
-   log.Printf("Successfully registered device %s with AWS", DEVICE_ID)
-   return nil
+// Thing structure within UploadRequest
+type Thing struct {
+	ProductId   string `json:"productId"`
+	MediaUrl    string `json:"mediaUrl"`
+	NfcTagId    string `json:"nfcTagId"`
+	ProductName string `json:"productName"`
 }
 
-func startHeartbeat() {
-   ticker := time.NewTicker(HEARTBEAT_INTERVAL)
-   go func() {
-       for range ticker.C {
-           ip, err := getLocalIP()
-           if err != nil {
-               log.Printf("Failed to get IP: %v", err)
-               continue
-           }
-           
-           if err := registerWithAWS(ip); err != nil {
-               log.Printf("Heartbeat failed: %v", err)
-           }
-       }
-   }()
+// Function to fetch the public ngrok URL
+func getNgrokURL() (string, error) {
+	resp, err := http.Get("http://localhost:4040/api/tunnels")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch ngrok URL: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to parse ngrok response: %v", err)
+	}
+
+	tunnels, ok := result["tunnels"].([]interface{})
+	if !ok || len(tunnels) == 0 {
+		return "", fmt.Errorf("no tunnels found in ngrok response")
+	}
+
+	publicURL, ok := tunnels[0].(map[string]interface{})["public_url"].(string)
+	if !ok {
+		return "", fmt.Errorf("failed to extract public URL from ngrok response")
+	}
+
+	log.Printf("Ngrok URL: %s", publicURL)
+	return publicURL, nil
 }
 
+// Function to register the device with AWS
+func registerWithAWS(publicUrl string) error {
+	log.Printf("Registering device %s with URL %s", DEVICE_ID, publicUrl)
+
+	registration := DeviceRegistration{
+		DeviceId:  DEVICE_ID,
+		IpAddress: publicUrl,
+	}
+
+	jsonData, err := json.Marshal(registration)
+	if err != nil {
+		return fmt.Errorf("failed to marshal registration data: %v", err)
+	}
+
+	log.Printf("Payload for registration: %s", string(jsonData))
+
+	client := &http.Client{
+		Timeout: 30 * time.Second, // Increased timeout for network reliability
+	}
+	resp, err := client.Post(AWS_REGISTRY_ENDPOINT, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to send registration request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("Response from AWS: %s", string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to register device: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Successfully registered device %s", DEVICE_ID)
+	return nil
+}
+
+// Function to handle incoming upload requests
 func handleUpload(w http.ResponseWriter, r *http.Request) {
-   if r.Method != http.MethodPost {
-       http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-       return
-   }
+	log.Printf("============ NEW UPLOAD REQUEST ============")
+	log.Printf("Received upload request from: %s", r.RemoteAddr)
 
-   var req UploadRequest
-   if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-       http.Error(w, "Invalid request body", http.StatusBadRequest)
-       return
-   }
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-   // Create project directory
-   projectDir := filepath.Join(STORAGE_PATH, req.ProjectId)
-   if err := os.MkdirAll(projectDir, 0755); err != nil {
-       http.Error(w, "Failed to create project directory", http.StatusInternalServerError)
-       return
-   }
+	var req UploadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Error decoding JSON: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	log.Printf("Decoded request: %+v", req)
 
-   // Process each thing concurrently
-   var wg sync.WaitGroup
-   errorsChan := make(chan error, len(req.Things))
+	projectDir := filepath.Join(STORAGE_PATH, req.ProjectId)
+	log.Printf("Creating project directory: %s", projectDir)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		log.Printf("Failed to create project directory: %v", err)
+		http.Error(w, "Failed to create project directory", http.StatusInternalServerError)
+		return
+	}
 
-   for _, thing := range req.Things {
-       wg.Add(1)
-       go func(t Thing) {
-           defer wg.Done()
-           if err := processContent(projectDir, t); err != nil {
-               errorsChan <- fmt.Errorf("failed to process %s: %v", t.ProductId, err)
-           }
-       }(thing)
-   }
+	var wg sync.WaitGroup
+	errorsChan := make(chan error, len(req.Things))
 
-   // Wait for all goroutines to finish
-   wg.Wait()
-   close(errorsChan)
+	for _, thing := range req.Things {
+		wg.Add(1)
+		go func(t Thing) {
+			defer wg.Done()
+			log.Printf("Processing thing: %+v", t)
+			if err := processContent(projectDir, t); err != nil {
+				log.Printf("Error processing thing %s: %v", t.ProductId, err)
+				errorsChan <- fmt.Errorf("failed to process %s: %v", t.ProductId, err)
+			} else {
+				log.Printf("Successfully processed thing: %s", t.ProductId)
+			}
+		}(thing)
+	}
 
-   // Check for any errors
-   var errors []string
-   for err := range errorsChan {
-       errors = append(errors, err.Error())
-   }
+	wg.Wait()
+	close(errorsChan)
 
-   if len(errors) > 0 {
-       response := map[string]interface{}{
-           "status": "partial_success",
-           "errors": errors,
-       }
-       json.NewEncoder(w).Encode(response)
-       return
-   }
+	var errors []string
+	for err := range errorsChan {
+		errors = append(errors, err.Error())
+	}
 
-   json.NewEncoder(w).Encode(map[string]string{
-       "status":  "success",
-       "message": fmt.Sprintf("Successfully processed deployment %s", req.DeploymentId),
-   })
+	if len(errors) > 0 {
+		log.Printf("Processing completed with errors: %v", errors)
+		response := map[string]interface{}{
+			"status": "partial_success",
+			"errors": errors,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	log.Printf("All content processed successfully")
+	response := map[string]string{
+		"status":  "success",
+		"message": fmt.Sprintf("Successfully processed deployment %s", req.DeploymentId),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
+// Function to download and store content
 func processContent(projectDir string, thing Thing) error {
-   // Get the file from the MediaUrl
-   resp, err := http.Get(thing.MediaUrl)
-   if err != nil {
-       return fmt.Errorf("failed to download content: %v", err)
-   }
-   defer resp.Body.Close()
+	log.Printf("Downloading content from: %s", thing.MediaUrl)
 
-   if resp.StatusCode != http.StatusOK {
-       return fmt.Errorf("failed to download content, status: %d", resp.StatusCode)
-   }
+	resp, err := http.Get(thing.MediaUrl)
+	if err != nil {
+		return fmt.Errorf("failed to download content: %v", err)
+	}
+	defer resp.Body.Close()
 
-   // Create file path
-   filename := filepath.Join(projectDir, fmt.Sprintf("%s.mp4", thing.ProductId))
-   
-   // Create the file
-   out, err := os.Create(filename)
-   if err != nil {
-       return fmt.Errorf("failed to create file: %v", err)
-   }
-   defer out.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download content, status: %d", resp.StatusCode)
+	}
 
-   // Copy the content
-   if _, err := io.Copy(out, resp.Body); err != nil {
-       return fmt.Errorf("failed to save content: %v", err)
-   }
+	filename := filepath.Join(projectDir, fmt.Sprintf("%s.mp4", thing.ProductId))
+	out, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %v", err)
+	}
+	defer out.Close()
 
-   // Save metadata
-   metadataFilename := filepath.Join(projectDir, fmt.Sprintf("%s.json", thing.ProductId))
-   metadataFile, err := os.Create(metadataFilename)
-   if err != nil {
-       return fmt.Errorf("failed to create metadata file: %v", err)
-   }
-   defer metadataFile.Close()
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("failed to save content: %v", err)
+	}
 
-   return json.NewEncoder(metadataFile).Encode(thing)
+	metadataFilename := filepath.Join(projectDir, fmt.Sprintf("%s.json", thing.ProductId))
+	metadataFile, err := os.Create(metadataFilename)
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %v", err)
+	}
+	defer metadataFile.Close()
+
+	if err := json.NewEncoder(metadataFile).Encode(thing); err != nil {
+		return fmt.Errorf("failed to save metadata: %v", err)
+	}
+
+	log.Printf("Successfully saved content and metadata for product %s", thing.ProductId)
+	return nil
+}
+
+// Start the server and registration process
+func main() {
+	go func() {
+		cmd := exec.Command("ngrok", "http", "3000")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run()
+	}()
+
+	time.Sleep(5 * time.Second) // Wait for ngrok to start
+	ngrokURL, err := getNgrokURL()
+	if err != nil {
+		log.Fatalf("Error fetching ngrok URL: %v", err)
+	}
+
+	if err := registerWithAWS(ngrokURL); err != nil {
+		log.Fatalf("Device registration failed: %v", err)
+	}
+
+	startServer()
 }
 
 func startServer() {
-   // Ensure storage directory exists
-   if err := os.MkdirAll(STORAGE_PATH, 0755); err != nil {
-       log.Fatal(err)
-   }
+	if err := os.MkdirAll(STORAGE_PATH, 0755); err != nil {
+		log.Fatalf("Failed to create storage directory: %v", err)
+	}
 
-   mux := http.NewServeMux()
-   mux.HandleFunc("/receive-content", handleUpload)
+	http.HandleFunc("/receive-content", handleUpload)
 
-   server := &http.Server{
-       Addr:    ":3000",
-       Handler: mux,
-   }
-
-   log.Printf("Starting upload server on port 3000")
-   if err := server.ListenAndServe(); err != nil {
-       log.Fatal(err)
-   }
-}
-
-func main() {
-   // Register device with AWS on startup
-   ip, err := getLocalIP()
-   if err != nil {
-       log.Fatal(err)
-   }
-   
-   if err := registerWithAWS(ip); err != nil {
-       log.Fatal(err)
-   }
-
-   // Start heartbeat
-   startHeartbeat()
-
-   // Start server
-   go startServer()
-
-   // Keep main thread alive
-   select {}
+	log.Printf("Starting upload server on port 3000")
+	if err := http.ListenAndServe(":3000", nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
 }
